@@ -1,4 +1,4 @@
-# COMPAS Recidivism Analysis — Python Translation
+# COMPAS Recidivism Analysis — Python Translation & READ ME - Responsible Machine Learning - McHale - 2026.03.28
 
 ## Purpose
 
@@ -18,8 +18,8 @@ differences between the two approaches.
 
 ```
 .
-├── README.md
-└── Lecture_01_alignment_python.ipynb   # Main analysis notebook
+├── README_RML_Assignment_1_McHale_2026.03.28.md
+└── CODE_RML_Assignment_1_MCHALE_2026.03.28.ipynb   # Main analysis notebook
 ```
 
 ---
@@ -27,7 +27,6 @@ differences between the two approaches.
 ## Python Libraries Used
 
 | Library | Purpose |
-|---|---|---|
 | `pandas` | Data loading, filtering, transformation, cross-tabulations |
 | `numpy` | Numerical operations |
 | `matplotlib` | Bar chart visualizations (replaces ggplot2 / gridExtra) |
@@ -62,7 +61,7 @@ pip install statsmodels
 
 4. **Run all cells in order** (`Kernel → Restart & Run All` in Jupyter, or
    `Runtime → Run all` in Colab). The notebook fetches the dataset directly
-   from GitHub at runtime — no local data file is needed.
+   from GitHub at runtime.
 
 ---
 
