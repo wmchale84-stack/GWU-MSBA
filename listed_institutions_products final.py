@@ -15,13 +15,12 @@ DATA_DIR = "."
 AUDIT = True
 
 # CSV in DATA_DIR listing the institutions to keep.
-# The script looks for: an ID column whose name contains "rssd" or "id",
-# and a type column whose name contains "type" or "bank or cu"
-# (values like Bank / bank / CU / Credit Union all work).
-# Bank rows match on bank RSSD (IDRSSD). Credit union rows match on
-# EITHER the NCUA charter number or the credit union's RSSD; the
-# RSSD-to-charter crosswalk is built from the FOICU file.
+# Set the two column names below EXACTLY as they appear in the file's
+# header row (case-insensitive). LIST_TYPE_COL may be None if the file
+# has no type column.
 LIST_FILE = "institution_list.csv"
+LIST_ID_COL = "rssd"            # <-- name of the RSSD column in your file
+LIST_TYPE_COL = "bank or cu"    # <-- name of the type column, or None
 
 # Six quarters, oldest first: (bank_date, ncua_date, column_label)
 PERIODS = [
