@@ -15,11 +15,12 @@ DATA_DIR = "."
 AUDIT = True
 
 # CSV in DATA_DIR listing the institutions to keep.
-#   Preferred: columns institution_id[, institution_type]
-#   (institution_type = "Bank" or "Credit Union"; recommended because
-#   bank RSSD IDs and NCUA charter numbers are separate numbering
-#   systems and can collide)
-#   Also accepted: a plain headerless list of ID numbers.
+# The script looks for: an ID column whose name contains "rssd" or "id",
+# and a type column whose name contains "type" or "bank or cu"
+# (values like Bank / bank / CU / Credit Union all work).
+# Bank rows match on bank RSSD (IDRSSD). Credit union rows match on
+# EITHER the NCUA charter number or the credit union's RSSD; the
+# RSSD-to-charter crosswalk is built from the FOICU file.
 LIST_FILE = "institution_list.csv"
 
 # Six quarters, oldest first: (bank_date, ncua_date, column_label)
@@ -123,26 +124,46 @@ def scan_load(folder, sep, key, codes, skip_desc_row):
     return data
 
 
+def norm_type(s):
+    """Normalize institution-type strings: bank/BANK -> Bank;
+    cu, credit union, creditunion -> Credit Union."""
+    t = str(s).strip().lower().replace("_", " ").replace("-", " ")
+    if t in ("cu", "credit union", "creditunion"):
+        return "Credit Union"
+    if t == "bank":
+        return "Bank"
+    return str(s).strip()
+
+
 def load_id_list(path):
-    """Read the institution list. Returns a dataframe with institution_id
-    and, if provided, institution_type."""
+    """Read the institution list. Finds the ID column (name contains
+    'rssd' or 'id') and the type column (name contains 'type' or
+    'bank or cu'). Falls back to a headerless single-column list."""
     df = pd.read_csv(path)
-    cols = {c.lower().strip(): c for c in df.columns}
-    if "institution_id" in cols:
-        out = pd.DataFrame({
-            "institution_id": pd.to_numeric(df[cols["institution_id"]],
-                                            errors="coerce")
-        })
-        if "institution_type" in cols:
-            out["institution_type"] = (
-                df[cols["institution_type"]].astype(str).str.strip()
-            )
-    else:
+    id_col = None
+    type_col = None
+    for c in df.columns:
+        cl = str(c).lower().strip()
+        if id_col is None and ("rssd" in cl or "id" in cl):
+            id_col = c
+        if type_col is None and ("type" in cl or
+                                 ("bank" in cl and "cu" in cl)):
+            type_col = c
+    if id_col is None:
         # Headerless list of numbers: first row was read as the header
         df = pd.read_csv(path, header=None)
         out = pd.DataFrame({
             "institution_id": pd.to_numeric(df[0], errors="coerce")
         })
+    else:
+        out = pd.DataFrame({
+            "institution_id": pd.to_numeric(df[id_col], errors="coerce")
+        })
+        if type_col is not None:
+            out["institution_type"] = df[type_col].map(norm_type)
+        print(f"List columns used: id = '{id_col}'"
+              + (f", type = '{type_col}'" if type_col else
+                 " (no type column found)"))
     out = out.dropna(subset=["institution_id"])
     out["institution_id"] = out["institution_id"].astype("int64")
     return out.drop_duplicates()
@@ -195,7 +216,6 @@ for f in bank_frames[1:]:
 save_audit(banks, "step2_banks_merged.csv")
 
 # ---- calculations ----
-# Trailing-4-quarter fees (YTD arithmetic), converted to dollars
 banks["total_fees_ttm_4q"] = (
     banks["RIAD4080_20260630"]
     + banks["RIAD4080_20251231"]
@@ -209,15 +229,12 @@ for c in FEE_COMPONENTS:
         - banks[f"{c}_20250630"]
     ) * 1000
 
-# Current-quarter product totals, converted to dollars
 banks["total_deposits_20260630"] = banks["RCON2200_20260630"] * 1000
 banks["auto_loans_20260630"] = banks["RCONK137_20260630"] * 1000
-# Mortgage servicing UPB = RC-S M2a + M2b; NaN only if BOTH missing
 banks["mtg_servicing_upb_20260630"] = (
     banks[["RCONB804_20260630", "RCONB805_20260630"]]
     .sum(axis=1, min_count=1) * 1000
 )
-# Credit cards: consolidated (031 filers) where reported, else domestic
 banks["cc_loans_20260630"] = (
     banks["RCFDB538_20260630"].fillna(banks["RCONB538_20260630"]) * 1000
 )
@@ -228,6 +245,7 @@ banks["cc_nonaccrual_20260630"] = banks["RCONB577_20260630"] * 1000
 banks = banks.rename(columns={"IDRSSD": "institution_id"})
 banks["institution_name"] = banks["institution_id"].map(bank_names)
 banks["institution_type"] = "Bank"
+banks["cu_rssd"] = pd.NA
 save_audit(banks, "step3_banks_calculated.csv")
 
 # =====================================================================
@@ -235,6 +253,7 @@ save_audit(banks, "step3_banks_calculated.csv")
 # =====================================================================
 cu_frames = []
 cu_names = {}
+cu_rssd_map = {}     # CU_NUMBER -> RSSD, from FOICU (latest wins)
 
 for _, ncua_date, label in PERIODS:
     folder = os.path.join(DATA_DIR, f"ncua_{ncua_date}")
@@ -264,6 +283,16 @@ for _, ncua_date, label in PERIODS:
     if foicu_matches:
         foicu = pd.read_csv(foicu_matches[0], sep=",", low_memory=False)
         cu_names.update(dict(zip(foicu["CU_NUMBER"], foicu["CU_NAME"])))
+        # Crosswalk: FOICU carries each CU's RSSD alongside its charter
+        rssd_cols = [c for c in foicu.columns
+                     if "rssd" in str(c).lower()]
+        if rssd_cols:
+            rssd_vals = pd.to_numeric(foicu[rssd_cols[0]],
+                                      errors="coerce")
+            cu_rssd_map.update(
+                dict(zip(foicu["CU_NUMBER"], rssd_vals)))
+        else:
+            print(f"WARNING: no RSSD column found in FOICU for {label}")
     else:
         print(f"WARNING: no FOICU file found in {folder}")
 
@@ -274,34 +303,32 @@ for f in cu_frames[1:]:
 save_audit(cus, "step5_cus_merged.csv")
 
 # ---- calculations ----
-# NCUA values are already dollars; ACCT_131 is YTD like RIAD items
 cus["total_fees_ttm_4q"] = (
     cus["ACCT_131_20260630"]
     + cus["ACCT_131_20251231"]
     - cus["ACCT_131_20250630"]
 )
 
-# Current-quarter product totals (already dollars)
 cus["total_deposits_20260630"] = cus["ACCT_018_20260630"]
-# Auto = new + used vehicle; NaN only if BOTH missing
 cus["auto_loans_20260630"] = (
     cus[["ACCT_385_20260630", "ACCT_370_20260630"]]
     .sum(axis=1, min_count=1)
 )
 cus["mtg_servicing_upb_20260630"] = cus["ACCT_779A_20260630"]
-# Credit cards. NCUA reportable delinquency begins at 60 days, so these
-# buckets are NOT comparable to the banks' 30-89 bucket. ACCT_024B and
-# ACCT_045B are kept under their account codes; confirm each bucket's
-# definition in the quarter's AcctDesc file.
+# NCUA reportable delinquency begins at 60 days; ACCT_024B / ACCT_045B
+# kept under their account codes; confirm buckets in AcctDesc.
 cus["cc_loans_20260630"] = cus["ACCT_396_20260630"]
 
 cus = cus.rename(columns={"CU_NUMBER": "institution_id"})
 cus["institution_name"] = cus["institution_id"].map(cu_names)
 cus["institution_type"] = "Credit Union"
+cus["cu_rssd"] = cus["institution_id"].map(cu_rssd_map).astype("Int64")
 save_audit(cus, "step6_cus_calculated.csv")
 
 # =====================================================================
-# 3. Combine (audit step 7), then FILTER to the supplied list
+# 3. Combine (audit step 7), then FILTER to the supplied list.
+#    Banks match on RSSD (IDRSSD). Credit unions match on charter
+#    number OR RSSD via the FOICU crosswalk.
 # =====================================================================
 combined = pd.concat([banks, cus], ignore_index=True)
 combined["institution_id"] = pd.to_numeric(
@@ -311,37 +338,59 @@ save_audit(combined, "step7_combined_all.csv")
 id_list = load_id_list(os.path.join(DATA_DIR, LIST_FILE))
 print(f"Institution list: {len(id_list)} unique IDs loaded")
 
-if "institution_type" in id_list.columns:
-    keep_keys = set(zip(id_list["institution_id"],
-                        id_list["institution_type"]))
-    mask = combined.apply(
-        lambda r: (r["institution_id"], r["institution_type"]) in keep_keys,
-        axis=1)
-    group = combined[mask].copy()
+has_type = "institution_type" in id_list.columns
+if has_type:
+    bank_ids = set(id_list.loc[
+        id_list["institution_type"] == "Bank", "institution_id"])
+    cu_ids = set(id_list.loc[
+        id_list["institution_type"] == "Credit Union", "institution_id"])
 else:
-    keep_ids = set(id_list["institution_id"])
-    group = combined[combined["institution_id"].isin(keep_ids)].copy()
-    # Flag any ID that matched both a bank and a credit union
+    bank_ids = set(id_list["institution_id"])
+    cu_ids = set(id_list["institution_id"])
+
+is_bank_row = combined["institution_type"] == "Bank"
+bank_mask = is_bank_row & combined["institution_id"].isin(bank_ids)
+cu_charter_mask = (~is_bank_row
+                   & combined["institution_id"].isin(cu_ids))
+cu_rssd_mask = (~is_bank_row & combined["cu_rssd"].notna()
+                & combined["cu_rssd"].isin(cu_ids))
+group = combined[bank_mask | cu_charter_mask | cu_rssd_mask].copy()
+group["matched_on"] = "bank RSSD"
+group.loc[cu_charter_mask[group.index], "matched_on"] = "CU charter"
+group.loc[cu_rssd_mask[group.index]
+          & ~cu_charter_mask[group.index], "matched_on"] = "CU RSSD"
+
+if not has_type:
     dup = group.groupby("institution_id")["institution_type"].nunique()
     collisions = dup[dup > 1].index.tolist()
     if collisions:
         print("WARNING: these IDs matched BOTH a bank and a credit union "
-              "(add an institution_type column to your list to "
-              f"disambiguate): {collisions}")
+              "(your list's type column was not detected; check its "
+              f"header): {collisions}")
 
 # ---- audit step 8: match report, one row per listed ID ----
-matched = group[["institution_id", "institution_name",
-                 "institution_type"]].copy()
-matched["status"] = "matched"
-report = id_list.merge(matched, on="institution_id", how="left",
-                       suffixes=("_list", ""))
-report["status"] = report["status"].fillna("NOT FOUND")
+matched_ids = set(group["institution_id"].dropna())
+matched_rssds = set(group["cu_rssd"].dropna())
+report = id_list.copy()
+report["status"] = report["institution_id"].apply(
+    lambda i: "matched" if (i in matched_ids or i in matched_rssds)
+    else "NOT FOUND")
+name_by_key = {}
+for _, r in group.iterrows():
+    name_by_key[r["institution_id"]] = r["institution_name"]
+    if pd.notna(r["cu_rssd"]):
+        name_by_key[r["cu_rssd"]] = r["institution_name"]
+report["matched_name"] = report["institution_id"].map(name_by_key)
 save_audit(report, "step8_list_match_report.csv")
 
 not_found = report[report["status"] == "NOT FOUND"]
 if len(not_found):
-    print(f"NOTE: {len(not_found)} listed IDs not found in the data: "
-          f"{sorted(not_found['institution_id'].tolist())}")
+    nf_ids = sorted(not_found["institution_id"].tolist())
+    print(f"NOTE: {len(not_found)} listed IDs not found: {nf_ids[:20]}"
+          + (" ..." if len(nf_ids) > 20 else ""))
+
+print("Match summary by key:")
+print(group["matched_on"].value_counts().to_string())
 
 # ---- audit step 9: filtered group before percentage columns ----
 save_audit(group, "step9_group_filtered.csv")
@@ -361,7 +410,8 @@ for col, pct in [
 asset_cols = [f"total_assets_{label}" for _, _, label in PERIODS]
 fee_ttm_cols = [f"{c}_TTM" for c in FEE_COMPONENTS]
 final_cols = (
-    ["institution_id", "institution_name", "institution_type"]
+    ["institution_id", "cu_rssd", "institution_name", "institution_type",
+     "matched_on"]
     + asset_cols
     + ["total_fees_ttm_4q"]
     + fee_ttm_cols
@@ -389,7 +439,6 @@ for pct in ["pct_of_group_deposits", "pct_of_group_auto_loans",
             "pct_of_group_mtg_servicing", "pct_of_group_credit_card"]:
     print(f"  {pct} sums to {group[pct].sum():.1f} (should be ~100)")
 
-# Reconciliation: H032+H033+H034+H035 vs RIAD4080 (TTM basis)
 rec = group.loc[is_bank, fee_ttm_cols + ["total_fees_ttm_4q"]].dropna()
 if len(rec):
     diff = (rec[fee_ttm_cols].sum(axis=1)
@@ -397,4 +446,4 @@ if len(rec):
     ok = (diff <= 2000).sum()
     print(f"  Fee reconciliation: {ok} of {len(rec)} reporting banks "
           "have components summing to the total (within rounding)")
-print(group.to_string(index=False))
+print(group.head(15).to_string(index=False))
