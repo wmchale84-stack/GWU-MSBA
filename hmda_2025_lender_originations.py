@@ -109,7 +109,12 @@ panel_matches = [p for p in panel_matches
 if panel_matches:
     ppath = panel_matches[0]
     sep = "|" if ppath.lower().endswith(".txt") else ","
-    panel = pd.read_csv(ppath, sep=sep, low_memory=False)
+    try:
+        panel = pd.read_csv(ppath, sep=sep, low_memory=False)
+    except UnicodeDecodeError:
+        print("Panel file is not UTF-8; retrying with latin-1 encoding")
+        panel = pd.read_csv(ppath, sep=sep, low_memory=False,
+                            encoding="latin-1")
     lei_col = next((c for c in panel.columns
                     if str(c).strip().lower() == "lei"), None)
     name_col = next((c for c in panel.columns
